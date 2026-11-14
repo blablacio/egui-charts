@@ -14,6 +14,8 @@
 //! built-in and three host studies, and prints the median and worst frame; `-- bar-limit` runs
 //! it alone.
 //! `-- comparisons` measures moving-pointer frames with zero, one, two and five comparisons.
+//! `-- footprint-feed` compares raw/prepared admission, steady frames and live updates on
+//! 3,000 bars and 48,000 historical executions, with statistics, naked POC and output parity.
 //! `--regression <scenario>` runs a compact workload for `benches/check-regressions.sh`.
 
 use egui::{Rect, UiBuilder, pos2, vec2};
@@ -30,6 +32,8 @@ mod comparisons;
 #[path = "../examples/bare_chart.rs"]
 #[expect(dead_code, reason = "the bench draws only the example's sample bars")]
 mod example;
+#[path = "frame/footprint_feed.rs"]
+mod footprint_feed;
 mod frame;
 mod regression;
 
@@ -297,6 +301,7 @@ fn main() {
     println!();
     bar_limit(&filters, frames);
     comparisons::run(&filters, frames);
+    footprint_feed::run(&filters, frames);
 }
 
 /// A host footprint, without the feed's history budget, with executions on every visible bar.
