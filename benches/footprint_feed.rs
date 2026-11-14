@@ -1,6 +1,10 @@
 //! Matched raw and prepared history, including admission, steady frames and live updates.
 
-use super::frame;
+#[expect(
+    dead_code,
+    reason = "this bench reports total frame time, not tessellation separately"
+)]
+mod frame;
 use chrono::{DateTime, TimeDelta, Utc};
 use egui_charts::data::{
     Datafeed, FeedError, Footprint, FootprintBar, FootprintPage, FootprintRequest, HistoryPage,
@@ -95,14 +99,9 @@ fn milliseconds(samples: &[frame::Sample], percentile: f64) -> f64 {
     times[((times.len() - 1) as f64 * percentile) as usize]
 }
 
-pub fn run(filters: &[String], frames: usize) {
-    if !filters.is_empty()
-        && !filters
-            .iter()
-            .any(|filter| "footprint-feed".contains(filter.as_str()))
-    {
-        return;
-    }
+fn main() {
+    let frames: usize =
+        std::env::var("FRAME_TIME_FRAMES").map_or(300, |v| v.parse().expect("a frame count"));
     assert!(frames > 0, "at least one measured frame");
     println!(
         "\n| footprint-feed | load ms | steady p50 ms | steady p95 ms | live p50 ms | live p95 ms | shapes | vertices |"
