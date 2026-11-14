@@ -863,7 +863,10 @@ impl Chart {
             });
             let until = |boundary: Option<chrono::DateTime<chrono::Utc>>| {
                 boundary.map(|at| {
-                    if end || page.trades.iter().any(|trade| trade.ts == at) {
+                    if end
+                        || asked.before.is_none()
+                        || page.trades.iter().any(|trade| trade.ts == at)
+                    {
                         at.checked_add_signed(chrono::TimeDelta::nanoseconds(1))
                             .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
                     } else {

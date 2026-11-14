@@ -750,10 +750,7 @@ fn prepared_join_keeps_both_complete_sides_until_a_trade_page_fills_it() {
         .unwrap()
         .remove(0)
         .send(Ok(TradePage::new(
-            vec![
-                Tick::new(cutoff, 100.0, 2.0, None).with_id(99),
-                Tick::new(start + TimeDelta::seconds(130), 100.0, 11.0, None).with_id(7),
-            ],
+            vec![Tick::new(cutoff, 100.0, 2.0, None).with_id(99)],
             false,
         )));
     frames.run(&mut chart);
@@ -1453,7 +1450,7 @@ fn prepared_resume_retains_known_rows_before_the_new_subscription_gap() {
         .pop()
         .unwrap()
         .send(Ok(TradePage::new(
-            [420, 480, 550, 610].map(tick).to_vec(),
+            [420, 480, 550].map(tick).to_vec(),
             false,
         )));
     frames.run(&mut chart);

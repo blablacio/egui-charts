@@ -180,7 +180,8 @@ pub trait Datafeed: MaybeSend + 'static {
     fn history(&self, request: HistoryRequest, reply: Reply<HistoryPage>);
 
     /// Starts pushing live updates into `subscription.sink` until `unsubscribe`. The default does
-    /// nothing, which gives a history-only chart.
+    /// nothing, which gives a history-only chart. See [`trades`](Self::trades) for the feed's
+    /// obligation when joining the latest trade reply to this stream.
     fn subscribe(&self, subscription: Subscription) {
         let _ = subscription;
     }
@@ -209,6 +210,11 @@ pub trait Datafeed: MaybeSend + 'static {
     /// Up to `request.count` trades of the range `[request.since, request.before)`, the newest
     /// ones when there are more, so order flow survives a reload and follows the view back in
     /// time. The default answers [`FeedError::NotSupported`].
+    ///
+    /// For a latest request (`before` is `None`) made for a subscription, the feed must return a
+    /// page that joins the start of that subscription's stream without an unreported gap, including
+    /// pre-stream executions at the first live timestamp. A cache that may lag the stream is not
+    /// sufficient on its own.
     fn trades(&self, request: TradeRequest, reply: Reply<TradePage>) {
         let _ = request;
         reply.send(Err(FeedError::NotSupported));

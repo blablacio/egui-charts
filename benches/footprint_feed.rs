@@ -170,6 +170,7 @@ fn main() {
             .with_initial_bars(BARS)
             .with_chart_type(kind)
             .build();
+        chart.config_mut().show_countdown = false;
         let mut params = chart.chart_type_params().clone();
         params.footprint_statistics = true;
         params.footprint_naked_poc = true;
