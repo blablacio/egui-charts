@@ -313,12 +313,8 @@ pub fn render_footprint(
     // Use the existing half-gap so price markers do not shrink execution columns.
     let gutter = (mapping.bar_spacing * 0.04).min(2.5);
     // Bars cut by dropped executions are drawn as candles, not as complete footprint bars.
-    let complete_from = flow.complete_from();
     for (index, bar) in bars.iter().enumerate().take(end).skip(first) {
-        let Some(source) = flow
-            .bar_at(bar.time)
-            .filter(|_| complete_from.is_some_and(|from| bar.time >= from))
-        else {
+        let Some(source) = flow.complete_bar_at(bar.time) else {
             continue;
         };
         let x = mapping.idx_to_x(index);
@@ -997,9 +993,8 @@ pub(crate) fn row_edges<'a>(
     group: impl Fn(&Bar) -> i64 + 'a,
 ) -> impl Iterator<Item = f64> + 'a {
     bars.iter()
-        .filter(move |bar| flow.complete_from().is_some_and(|from| bar.time >= from))
         .filter_map(move |bar| {
-            let rows = &flow.bar_at(bar.time)?.levels;
+            let rows = &flow.complete_bar_at(bar.time)?.levels;
             let (&low, _) = rows.first_key_value()?;
             let (&high, _) = rows.last_key_value()?;
             let group = group(bar);
@@ -1275,8 +1270,8 @@ fn cell_color(
 /// Rows show total, bid, ask, delta, minimum and maximum intrabar delta, cumulative delta,
 /// delta percentage and ask/bid ratio (undefined without a denominator). Select other rows with
 /// [`render_footprint_statistics_rows`] or [`FootprintConfig::statistics_rows`] in
-/// [`crate::widget::Chart::show_footprint`]. Bars before
-/// [`Footprint::complete_from`] get no column and no share of the cumulative delta.
+/// [`crate::widget::Chart::show_footprint`]. Bars with incomplete executions get no column. Cumulative delta is unavailable across a
+/// missing join until it is filled, or a later complete session restarts the sum.
 /// Shared labels occupy the left margin. Numeric columns stay aligned with their bars and
 /// use unabbreviated volume values when they fit, then compact units. Percentages have one
 /// decimal and ask/bid ratios two decimals.
@@ -1366,22 +1361,28 @@ pub fn render_footprint_statistics_rows(
     }
     let mut cumulative = 0.0;
     let mut last_volume = None;
-    let complete = flow.complete_from();
+    let mut cumulative_start = None;
     let mut has_data = false;
     let mut columns = Vec::new();
     for (i, bar) in bars.iter().enumerate() {
         if restarts.binary_search(&i).is_ok() {
             cumulative = 0.0;
+            cumulative_start = Some(bar.time);
         }
-        let Some(row) = flow
-            .bar_at(bar.time)
-            .filter(|_| complete.is_some_and(|from| bar.time >= from))
-        else {
+        let Some(row) = flow.complete_bar_at(bar.time) else {
             continue;
         };
         cumulative += row.delta();
         let volume = row.volume();
-        let previous = last_volume.replace(volume);
+        let first_volume = last_volume.is_none();
+        let previous = last_volume
+            .replace((bar.time, volume))
+            .filter(|(time, _)| !flow.span_has_gap(*time, Some(bar.time)))
+            .map(|(_, volume)| volume);
+        let cumulative_known = !flow.span_has_gap(
+            cumulative_start.unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+            Some(bar.time),
+        );
         let x = mapping.idx_to_x(i);
         if !mapping.is_x_visible(x) {
             continue;
@@ -1408,7 +1409,7 @@ pub fn render_footprint_statistics_rows(
             Some(row.delta()),
             Some(row.min_delta),
             Some(row.max_delta),
-            Some(cumulative),
+            cumulative_known.then_some(cumulative),
             row.delta_percent(),
             (row.bid > 0.0).then(|| row.ask / row.bid),
             Some(row.trades() as f64),
@@ -1422,7 +1423,7 @@ pub fn render_footprint_statistics_rows(
                 .map(|previous| (volume - previous) / previous * 100.0),
         ];
         let values: Vec<_> = rows.iter().map(|row| values[*row as usize]).collect();
-        columns.push((x, previous.is_none(), values));
+        columns.push((x, first_volume, values));
     }
     let decimals = crate::scales::decimals(flow.tick_size());
     let mut size = 10.0;
@@ -1553,12 +1554,10 @@ pub(crate) fn render_footprint_annotations(
         imbalance_min_volume: config.imbalance_min_volume,
         ..settings.clone()
     };
-    let complete = flow.complete_from();
     let source: Vec<_> = bars
         .iter()
-        .filter(|bar| complete.is_some_and(|from| bar.time >= from))
         .filter_map(|bar| {
-            flow.bar_at(bar.time)
+            flow.complete_bar_at(bar.time)
                 .map(|row| (bar.time, row, row_group(mapping, bar, flow, config)))
         })
         .collect();
@@ -1586,7 +1585,8 @@ pub(crate) fn render_footprint_annotations(
                 .iter()
                 .map(|(bar, group)| (bar.as_ref(), *group))
                 .collect();
-            cache.studies = crate::studies::footprint_studies_on_rows(&rows, &settings).into();
+            cache.studies =
+                crate::studies::footprint_studies_on_rows(&rows, &settings, flow).into();
             cache.config = Some(settings);
             cache.revision = Some(flow.revision());
         }
@@ -1924,9 +1924,8 @@ mod tests {
         let eager = |selected: &[Bar], flow: &Footprint, config: &FootprintConfig| {
             let grouped: Vec<_> = selected
                 .iter()
-                .filter(|bar| flow.complete_from().is_some_and(|from| bar.time >= from))
                 .filter_map(|bar| {
-                    flow.bar_at(bar.time).map(|source| {
+                    flow.complete_bar_at(bar.time).map(|source| {
                         let group = row_group(&map, bar, flow, config);
                         let mut owned = FootprintBar::empty(source.time);
                         owned.absorb_grouped(source, group);
@@ -1939,7 +1938,7 @@ mod tests {
                 imbalance_min_volume: config.imbalance_min_volume,
                 ..config.studies.clone().unwrap()
             };
-            crate::studies::footprint_studies_on_rows(&rows, &settings)
+            crate::studies::footprint_studies_on_rows(&rows, &settings, flow)
         };
         for selected in [
             bars.clone(),
@@ -3059,6 +3058,107 @@ mod tests {
                 })
                 .collect();
             assert_eq!(texts, expected, "restarting: {}", sessions.is_some());
+        }
+    }
+
+    #[test]
+    fn prepared_gap_draws_known_statistics_without_a_partial_cumulative_total() {
+        use chrono::TimeDelta;
+        let start: chrono::DateTime<chrono::Utc> = "2026-01-05T10:00:00Z".parse().unwrap();
+        let cutoff = start + TimeDelta::seconds(90);
+        let mut flow = Footprint::new(BarClock::new(Timeframe::Min1), 1.0, 1).unwrap();
+        for (second, size) in [(0, 5.0), (60, 7.0)] {
+            flow.push(&Tick::new(
+                start + TimeDelta::seconds(second),
+                100.0,
+                size,
+                Some(OrderSide::Buy),
+            ))
+            .unwrap();
+        }
+        let mut tape = crate::data::trades::Trades::new(10);
+        for (second, size) in [(130, 11.0), (180, 13.0)] {
+            tape.push(Tick::new(
+                start + TimeDelta::seconds(second),
+                100.0,
+                size,
+                Some(OrderSide::Buy),
+            ));
+        }
+        flow.prepare_history(cutoff, &tape, false);
+        let bars = [0, 1, 2, 3].map(|minute| {
+            Bar::new(
+                start + TimeDelta::minutes(minute),
+                100.0,
+                100.0,
+                100.0,
+                100.0,
+                1.0,
+            )
+        });
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 16.0));
+        let map = ChartMapping::new(
+            rect,
+            60.0,
+            0,
+            3,
+            0.0,
+            PriceMap::new(
+                PriceTransform::default(),
+                PriceRange::new(99.0, 102.0),
+                0.0,
+                16.0,
+                false,
+            ),
+        );
+        let config = FootprintConfig {
+            statistics_rows: vec![FootprintStatistic::CumulativeDelta],
+            ..Default::default()
+        };
+        for (filled, expected) in [
+            (false, vec!["CVD", "5", "n/a"]),
+            (true, vec!["CVD", "5", "14", "25", "38"]),
+        ] {
+            if filled {
+                tape.prepend(
+                    vec![Tick::new(cutoff, 100.0, 2.0, Some(OrderSide::Buy))],
+                    &mut |_, _| (),
+                );
+            }
+            if filled {
+                flow.cover_missing(cutoff, start + TimeDelta::seconds(130));
+            }
+            flow.rebuild_prepared(&tape);
+            let mut output = egui::Context::default().run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    render_footprint_statistics_rows(
+                        ui.painter(),
+                        &map,
+                        &bars,
+                        &flow,
+                        &config,
+                        None,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(texts, expected);
+            assert_eq!(
+                row_edges(&bars, &flow, |_| 1).count(),
+                if filled { 8 } else { 4 }
+            );
         }
     }
 
