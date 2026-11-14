@@ -328,6 +328,7 @@ mod tests {
     use crate::model::{BarClock, OrderSide, Tick, Timeframe};
     use chrono::TimeDelta;
 
+    #[cfg(feature = "widget")]
     #[test]
     fn missing_join_withholds_only_unproven_annotation_outcomes() {
         let start: DateTime<Utc> = "2026-01-05T10:00:00Z".parse().unwrap();

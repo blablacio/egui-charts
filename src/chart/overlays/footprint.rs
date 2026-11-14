@@ -1367,7 +1367,7 @@ pub fn render_footprint_statistics_rows(
     for (i, bar) in bars.iter().enumerate() {
         if restarts.binary_search(&i).is_ok() {
             cumulative = 0.0;
-            cumulative_start = Some(bar.time);
+            cumulative_start = Some(flow.clock().bar_open(bar.time));
         }
         let Some(row) = flow.complete_bar_at(bar.time) else {
             continue;
@@ -3062,6 +3062,79 @@ mod tests {
     }
 
     #[test]
+    fn prepared_gap_before_the_session_bar_stamp_keeps_cumulative_unknown() {
+        let start: chrono::DateTime<chrono::Utc> = "2026-01-05T00:00:00Z".parse().unwrap();
+        let mut flow = Footprint::new(BarClock::new(Timeframe::Min1), 1.0, 1).unwrap();
+        for minute in 0..2 {
+            flow.push(&Tick::new(
+                start + chrono::TimeDelta::minutes(minute),
+                100.0,
+                2.0,
+                Some(OrderSide::Buy),
+            ))
+            .unwrap();
+        }
+        flow.add_missing(start, start + chrono::TimeDelta::seconds(20));
+        let bars = [0, 1].map(|minute| {
+            Bar::new(
+                start + chrono::TimeDelta::seconds(minute * 60 + 30),
+                100.0,
+                100.0,
+                100.0,
+                100.0,
+                1.0,
+            )
+        });
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(240.0, 16.0));
+        let map = ChartMapping::new(
+            rect,
+            60.0,
+            0,
+            1,
+            0.0,
+            PriceMap::new(
+                PriceTransform::default(),
+                PriceRange::new(99.0, 102.0),
+                0.0,
+                16.0,
+                false,
+            ),
+        );
+        let config = FootprintConfig {
+            statistics_rows: vec![FootprintStatistic::CumulativeDelta],
+            ..Default::default()
+        };
+        let days =
+            crate::model::ExchangeSessionProvider::new(crate::model::TimezoneId::utc(), None);
+        let mut output = egui::Context::default().run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                render_footprint_statistics_rows(
+                    ui.painter(),
+                    &map,
+                    &bars,
+                    &flow,
+                    &config,
+                    Some(&days),
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                Shape::Text(t) => Some(t.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["CVD", "n/a"]);
+    }
+
+    #[test]
     fn prepared_gap_draws_known_statistics_without_a_partial_cumulative_total() {
         use chrono::TimeDelta;
         let start: chrono::DateTime<chrono::Utc> = "2026-01-05T10:00:00Z".parse().unwrap();
@@ -3126,7 +3199,10 @@ mod tests {
                 );
             }
             if filled {
-                flow.cover_missing(cutoff, start + TimeDelta::seconds(130));
+                flow.cover_missing(
+                    cutoff,
+                    start + TimeDelta::seconds(130) + TimeDelta::nanoseconds(1),
+                );
             }
             flow.rebuild_prepared(&tape);
             let mut output = egui::Context::default().run_ui(

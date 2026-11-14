@@ -232,6 +232,7 @@ impl Chart {
                 },
                 Request::Footprints(asked) => match result::<crate::data::FootprintPage>(answer) {
                     Ok(page) => self.apply_footprints(&mut link, &asked, page),
+                    Err(FeedError::NotSupported) => link.footprints_complete = true,
                     Err(error) => self.request_failed(&mut link, request, failures, error, now),
                 },
                 Request::Trades(asked) => match result::<TradePage>(answer) {
@@ -481,7 +482,7 @@ impl Chart {
             }
         }
         self.scroll_back(&mut link);
-        self.scroll_trades(&mut link);
+        self.scroll_trades(&mut link, executions);
         self.scroll_depth(&mut link);
         self.feed.trade_history_complete = link.trades_complete;
         self.feed.depth_history_complete = link.depth_complete || link.depth_history.is_none();
@@ -817,9 +818,6 @@ impl Chart {
             ));
         } else if matches!(request, Request::Footprints(_)) {
             link.footprints_complete = true;
-            if error == FeedError::NotSupported {
-                return;
-            }
         } else if matches!(request, Request::Depth(_)) {
             link.depth_complete = true;
             if error == FeedError::NotSupported {
@@ -863,25 +861,39 @@ impl Chart {
                 asked.before.is_none_or(|before| t.ts < before)
                     && asked.since.is_none_or(|since| t.ts >= since)
             });
+            let until = |boundary: Option<chrono::DateTime<chrono::Utc>>| {
+                boundary.map(|at| {
+                    if end || page.trades.iter().any(|trade| trade.ts == at) {
+                        at.checked_add_signed(chrono::TimeDelta::nanoseconds(1))
+                            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                    } else {
+                        at
+                    }
+                })
+            };
             valid_range.then_some((
                 from.max(asked.since.unwrap_or(from)),
                 asked
                     .before
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC),
-                link.trades.iter().next().map(|t| t.ts),
-                link.trades.live().next().map(|t| t.ts),
+                until(link.trades.iter().next().map(|t| t.ts)),
+                until(link.trades.live().next().map(|t| t.ts)),
             ))
         });
-        let ambiguous_retained = link.trades.retained_until().filter(|at| {
-            let ids = link
-                .trades
-                .iter()
-                .filter(|t| t.ts == *at)
-                .all(|t| t.id.is_some());
-            page.trades
-                .iter()
-                .any(|t| t.ts == *at && !(ids && t.id.is_some()))
-        });
+        let ambiguous_retained = link
+            .trades
+            .retained_until()
+            .filter(|at| prepared_before.is_some_and(|before| *at >= before))
+            .filter(|at| {
+                let ids = link
+                    .trades
+                    .iter()
+                    .filter(|t| t.ts == *at)
+                    .all(|t| t.id.is_some());
+                page.trades
+                    .iter()
+                    .any(|t| t.ts == *at && !(ids && t.id.is_some()))
+            });
         let mut tail_changed = false;
         let mut changed = false;
         let fold = &mut |trade: &Tick, added| {
@@ -914,7 +926,10 @@ impl Chart {
                 }
             }
             if let Some(at) = ambiguous_retained {
-                flow.add_missing(at, at + chrono::TimeDelta::nanoseconds(1));
+                let after = at
+                    .checked_add_signed(chrono::TimeDelta::nanoseconds(1))
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+                flow.add_missing(at, after);
             }
             if tail_changed {
                 flow.rebuild_prepared(&link.trades);
@@ -942,9 +957,10 @@ impl Chart {
 
     /// Asks for trades older than the oldest held once the view reaches it, for the order flow
     /// that consumes them: bubbles, a footprint or a study.
-    fn scroll_trades(&mut self, link: &mut FeedLink) {
-        let consumed =
-            link.bubbles.is_some() || link.footprint.is_some() || !link.study_inputs.is_empty();
+    fn scroll_trades(&mut self, link: &mut FeedLink, executions: bool) {
+        let consumed = link.bubbles.is_some()
+            || (executions && link.footprint.is_some())
+            || !link.study_inputs.is_empty();
         let asking = |r: &Request| matches!(r, Request::Trades(_));
         if !consumed
             || link.trades_complete
@@ -1100,7 +1116,7 @@ impl Chart {
 
 /// The error for a continuation `at` that does not lie before the `before` it was asked for,
 /// which would repeat the request.
-fn non_progressing(
+pub(super) fn non_progressing(
     before: Option<chrono::DateTime<chrono::Utc>>,
     at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<FeedError> {

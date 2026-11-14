@@ -1,5 +1,6 @@
 //! Prepared pages use the normal request lifecycle and retain their rows outside the tape.
 
+use super::pump::non_progressing;
 use super::{FeedLink, MIN_SCROLL_BACK_PAGE, Request};
 use crate::data::{FeedError, Footprint, FootprintPage, FootprintRequest};
 use crate::model::ChartType;
@@ -90,22 +91,34 @@ impl Chart {
         page: FootprintPage,
     ) -> Result<(), FeedError> {
         let invalid = |message: &str| FeedError::InvalidData(message.to_owned());
-        if page.bars.len() > request.count
-            || page.bars.iter().any(|bar| {
-                request.before.is_some_and(|before| bar.time >= before)
-                    || request.since.is_some_and(|since| bar.time < since)
-                    || bar.time >= page.complete_before
-            })
-        {
+        if page.bars.len() > request.count {
+            return Err(FeedError::InvalidData(format!(
+                "footprint page has {} bars, exceeding the requested {}",
+                page.bars.len(),
+                request.count
+            )));
+        }
+        if page.bars.iter().any(|bar| {
+            request.before.is_some_and(|before| bar.time >= before)
+                || request.since.is_some_and(|since| bar.time < since)
+                || bar.time >= page.complete_before
+        }) {
             return Err(invalid(
                 "footprint page lies outside its requested range or execution cutoff",
             ));
         }
         let empty = page.bars.is_empty();
         let continuation = page.continue_before.filter(|_| empty);
-        if continuation.is_some_and(|at| request.before.is_some_and(|before| at >= before)) {
+        if let Some(error) = non_progressing(request.before, continuation) {
+            return Err(error);
+        }
+        if (!empty || continuation.is_some())
+            && request
+                .before
+                .is_some_and(|before| page.complete_before != before)
+        {
             return Err(invalid(
-                "footprint continuation must precede the requested boundary",
+                "footprint page must cover through the requested boundary",
             ));
         }
         let mut flow = Footprint::from_bars(
@@ -120,12 +133,6 @@ impl Chart {
                 .as_mut()
                 .filter(|flow| flow.prepared_before().is_some())
             {
-                let oldest = held.bars().first_key_value().map(|(time, _)| *time);
-                if Some(page.complete_before) != oldest {
-                    return Err(invalid(
-                        "footprint page does not join the held prepared history",
-                    ));
-                }
                 held.prepend_prepared(flow);
             } else {
                 flow.prepare_history(page.complete_before, &link.trades, link.trades_from_start);

@@ -573,7 +573,8 @@ pub struct FootprintRequest {
     pub before: Option<DateTime<Utc>>,
     /// Only bars opening at or after this instant; see [`HistoryRequest::since`].
     pub since: Option<DateTime<Utc>>,
-    /// Maximum bars wanted, the newest ones in the requested range.
+    /// Maximum bars wanted, the newest ones in the requested range. A page exceeding this
+    /// count is rejected as [`FeedError::InvalidData`], not truncated.
     pub count: usize,
     /// Include extended hours, with the same meaning as [`HistoryRequest::extended_hours`].
     pub extended_hours: bool,
@@ -599,8 +600,9 @@ pub struct FootprintPage {
     /// before this instant is included, and none at this instant is. Held or live trades at
     /// or after it continue the page; trade IDs do not order or define this boundary.
     /// If a snapshot ends partway through one timestamp, exclude that entire instant.
-    /// An older page must cover through the oldest prepared bar already held, including
-    /// any empty region skipped by `continue_before`; otherwise it is rejected as disjoint.
+    /// An older page with bars or a continuation must end at [`FootprintRequest::before`].
+    /// An empty continuation certifies that nothing traded from `continue_before` to that
+    /// boundary, so the next page can end at its own requested boundary without a gap.
     pub complete_before: DateTime<Utc>,
     /// Nothing exists before the oldest returned bar, or the requested boundary for an empty page.
     pub end_of_history: bool,

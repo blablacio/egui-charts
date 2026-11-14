@@ -574,12 +574,13 @@ fn prepared_history_joins_live_once_and_keeps_unknown_sides() {
         Tick::new(start + TimeDelta::minutes(1), 101.0, 3.0, Some(Sell)),
         Tick::new(start + TimeDelta::minutes(2), 102.0, 5.0, None),
     ];
-    let live = vec![
-        Tick::new(cutoff, 102.0, 7.0, Some(Buy)).with_id(99),
-        Tick::new(cutoff, 102.0, 11.0, None).with_id(7),
-        Tick::new(cutoff + TimeDelta::seconds(1), 102.0, 13.0, Some(Sell)).with_id(42),
-    ];
-    for page_first in [false, true] {
+    for (page_first, delay) in [(false, 0), (true, 0), (false, 2), (true, 2)] {
+        let first = cutoff + TimeDelta::seconds(delay);
+        let live = vec![
+            Tick::new(first, 102.0, 7.0, Some(Buy)).with_id(99),
+            Tick::new(first, 102.0, 11.0, None).with_id(7),
+            Tick::new(first + TimeDelta::seconds(1), 102.0, 13.0, Some(Sell)).with_id(42),
+        ];
         let (feed, mut chart, mut frames) = prepared_chart();
         let mut reply = Some(feed.footprints.lock().unwrap().remove(0));
         let mut deliver = || {
@@ -636,7 +637,7 @@ fn prepared_history_joins_live_once_and_keeps_unknown_sides() {
             expected.bars,
             "page first: {page_first}"
         );
-        assert_eq!(flow.complete_from(), Some(start));
+        assert_eq!(flow.complete_from(), Some(start), "{page_first}, {delay}");
         assert_eq!(flow.bar_at(cutoff).unwrap().unknown, 16.0);
     }
 }
@@ -749,7 +750,10 @@ fn prepared_join_keeps_both_complete_sides_until_a_trade_page_fills_it() {
         .unwrap()
         .remove(0)
         .send(Ok(TradePage::new(
-            vec![Tick::new(cutoff, 100.0, 2.0, None).with_id(99)],
+            vec![
+                Tick::new(cutoff, 100.0, 2.0, None).with_id(99),
+                Tick::new(start + TimeDelta::seconds(130), 100.0, 11.0, None).with_id(7),
+            ],
             false,
         )));
     frames.run(&mut chart);
@@ -768,7 +772,7 @@ fn prepared_join_keeps_both_complete_sides_until_a_trade_page_fills_it() {
 #[test]
 fn prepared_pages_reject_invalid_ranges_and_nonprogressing_continuations() {
     let start = bars(1)[0].time;
-    for case in 0..6 {
+    for case in 0..7 {
         let (feed, mut chart, mut frames) = prepared_chart();
         let request = feed
             .calls()
@@ -794,6 +798,10 @@ fn prepared_pages_reject_invalid_ranges_and_nonprogressing_continuations() {
                 page.bars.clear();
                 asked.before = Some(page.complete_before);
                 page.continue_before = asked.before;
+                if case == 6 {
+                    page.continue_before = Some(start);
+                    page.complete_before -= TimeDelta::seconds(1);
+                }
             }
         }
         // Keep the normal reply key and replace only its requested limits for this validation row.
@@ -892,8 +900,7 @@ fn prepared_pages_continue_backwards_without_bridging_disjoint_coverage() {
                 .iter()
                 .any(|c| matches!(c, Call::Footprints(r) if r.before == Some(boundary)))
         );
-        // An empty continuation can skip a known-empty region, but the next page must
-        // still attest to coverage through the held boundary.
+        // The empty reply certifies its own window; the next reply knows only its request.
         let cursor = start + TimeDelta::minutes(1);
         feed.footprints
             .lock()
@@ -915,7 +922,11 @@ fn prepared_pages_continue_backwards_without_bridging_disjoint_coverage() {
             .remove(0)
             .send(Ok(prepared_page(
                 &[Tick::new(start, 100.0, 7.0, None)],
-                if disjoint { cursor } else { boundary },
+                if disjoint {
+                    cursor - TimeDelta::seconds(1)
+                } else {
+                    cursor
+                },
                 true,
             )));
         frames.run(&mut chart);
@@ -946,6 +957,159 @@ fn prepared_pages_continue_backwards_without_bridging_disjoint_coverage() {
     assert!(
         feed.footprints.lock().unwrap().is_empty(),
         "an empty page without a cursor ends paging"
+    );
+}
+
+#[test]
+fn prepared_join_uses_the_stream_start_after_a_context_change() {
+    let start = bars(1)[0].time;
+    for resume in [false, true] {
+        let (feed, mut chart, mut frames) = prepared_chart();
+        let tick = |minute, size| Tick::new(start + TimeDelta::minutes(minute), 100.0, size, None);
+        feed.sink().push_tick(tick(20, 7.0));
+        frames.run(&mut chart);
+        feed.footprints.lock().unwrap().clear();
+        if resume {
+            chart.set_feed_paused(true);
+            frames.run(&mut chart);
+            chart.set_feed_paused(false);
+        } else {
+            chart.set_timeframe(Timeframe::Min5);
+        }
+        frames.run(&mut chart);
+        feed.resolve()
+            .send(Ok(Instrument::new("A").with_tick_size(1.0)));
+        feed.page().send(page(bars(24), true));
+        frames.run(&mut chart);
+        feed.sink().push_tick(tick(21, 11.0));
+        feed.sink().push_tick(tick(23, 13.0));
+        frames.run(&mut chart);
+        let timeframe = if resume {
+            Timeframe::Min1
+        } else {
+            Timeframe::Min5
+        };
+        let mut saved = Footprint::new(BarClock::new(timeframe), 1.0, 1).unwrap();
+        for trade in [tick(20, 7.0), tick(21, 11.0)] {
+            saved.push(&trade).unwrap();
+        }
+        feed.footprints
+            .lock()
+            .unwrap()
+            .remove(0)
+            .send(Ok(FootprintPage::new(
+                saved.bars().values().cloned().collect(),
+                start + TimeDelta::seconds(1290),
+                true,
+            )));
+        for trade_page in [false, true] {
+            if trade_page {
+                feed.trades
+                    .lock()
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+                    .send(Ok(TradePage::new(
+                        vec![tick(20, 7.0), tick(21, 11.0)],
+                        false,
+                    )));
+            }
+            frames.run(&mut chart);
+            let flow = chart
+                .feed_link
+                .as_ref()
+                .unwrap()
+                .footprint
+                .as_ref()
+                .unwrap();
+            assert!(
+                !flow.span_has_gap(start, None),
+                "resume {resume}, trade page {trade_page}"
+            );
+            assert_eq!(flow.complete_from(), Some(start + TimeDelta::minutes(20)));
+        }
+    }
+}
+
+#[test]
+fn prepared_repeated_retained_trade_before_cutoff_keeps_its_bar_complete() {
+    let (feed, mut chart, mut frames) = prepared_chart();
+    let start = bars(1)[0].time;
+    let retained = Tick::new(start + TimeDelta::minutes(3), 100.0, 7.0, None);
+    feed.footprints
+        .lock()
+        .unwrap()
+        .remove(0)
+        .send(Ok(prepared_page(
+            std::slice::from_ref(&retained),
+            start + TimeDelta::minutes(5),
+            true,
+        )));
+    feed.sink().push_tick(retained.clone());
+    frames.run(&mut chart);
+    chart.set_feed_paused(true);
+    frames.run(&mut chart);
+    chart.set_feed_paused(false);
+    frames.run(&mut chart);
+    feed.resolve()
+        .send(Ok(Instrument::new("A").with_tick_size(1.0)));
+    frames.run(&mut chart);
+    feed.trades
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap()
+        .send(Ok(TradePage::new(vec![retained.clone()], false)));
+    frames.run(&mut chart);
+    let flow = chart
+        .feed_link
+        .as_ref()
+        .unwrap()
+        .footprint
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        flow.complete_bar_at(retained.ts).map(|bar| bar.unknown),
+        Some(7.0)
+    );
+}
+
+#[test]
+fn prepared_repeated_maximum_timestamp_does_not_panic() {
+    let (feed, mut chart, mut frames) = prepared_chart();
+    let start = bars(1)[0].time;
+    feed.footprints
+        .lock()
+        .unwrap()
+        .remove(0)
+        .send(Ok(prepared_page(
+            &[Tick::new(start, 100.0, 5.0, None)],
+            start + TimeDelta::minutes(1),
+            true,
+        )));
+    frames.run(&mut chart);
+    let trade = Tick::new(DateTime::<Utc>::MAX_UTC, 100.0, 1.0, None);
+    let link = chart.feed_link.as_mut().unwrap();
+    link.trades.prepend(vec![trade.clone()], &mut |_, _| ());
+    link.trades.reanchor();
+    feed.trades
+        .lock()
+        .unwrap()
+        .remove(0)
+        .send(Ok(TradePage::new(vec![trade], false)));
+    frames.run(&mut chart);
+    assert_eq!(
+        chart
+            .feed_link
+            .as_ref()
+            .unwrap()
+            .footprint
+            .as_ref()
+            .unwrap()
+            .bar_at(start)
+            .unwrap()
+            .unknown,
+        5.0
     );
 }
 
@@ -1002,6 +1166,160 @@ fn prepared_request_matches_ohlc_context() {
         )
     );
     assert_eq!((rows.tick_size, rows.ticks_per_row), (0.25, 1));
+}
+
+#[test]
+fn prepared_rows_clear_on_context_reset_and_tick_size_changes() {
+    let start = bars(1)[0].time;
+    for change in 0..7 {
+        let (feed, mut chart, mut frames) = prepared_chart();
+        feed.footprints
+            .lock()
+            .unwrap()
+            .remove(0)
+            .send(Ok(prepared_page(
+                &[Tick::new(start, 100.0, 5.0, None)],
+                start + TimeDelta::minutes(1),
+                true,
+            )));
+        frames.run(&mut chart);
+        match change {
+            0 => chart.set_symbol("B"),
+            1 => chart.set_timeframe(Timeframe::Min5),
+            2 => chart.set_extended_hours(true),
+            3 => chart.set_dividend_adjusted(true),
+            4 => chart.set_conversion(Some("EUR".into())),
+            5 => feed.sink().reset_replay(start),
+            _ => {
+                chart.set_feed_paused(true);
+                frames.run(&mut chart);
+                chart.set_feed_paused(false);
+                frames.run(&mut chart);
+                feed.resolve()
+                    .send(Ok(Instrument::new("A").with_tick_size(0.25)));
+            }
+        }
+        frames.run(&mut chart);
+        assert!(
+            chart
+                .feed_link
+                .as_ref()
+                .unwrap()
+                .footprint
+                .as_ref()
+                .is_none_or(|flow| flow.prepared_before().is_none()),
+            "change {change}"
+        );
+    }
+}
+
+#[test]
+fn unused_prepared_rows_do_not_request_more_raw_trades() {
+    let (feed, mut chart, mut frames) = prepared_chart();
+    let start = bars(1)[0].time;
+    feed.footprints
+        .lock()
+        .unwrap()
+        .remove(0)
+        .send(Ok(prepared_page(
+            &[Tick::new(start, 100.0, 5.0, None)],
+            start + TimeDelta::minutes(5),
+            true,
+        )));
+    frames.run(&mut chart);
+    chart.set_chart_type(ChartType::Candles);
+    feed.trades
+        .lock()
+        .unwrap()
+        .remove(0)
+        .send(Ok(TradePage::new(
+            vec![Tick::new(start + TimeDelta::minutes(2), 100.0, 1.0, None)],
+            false,
+        )));
+    feed.calls();
+    for _ in 0..2 {
+        frames.run(&mut chart);
+    }
+    assert!(
+        !feed
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Trades(_)))
+    );
+    assert!(
+        chart
+            .feed_link
+            .as_ref()
+            .unwrap()
+            .footprint
+            .as_ref()
+            .unwrap()
+            .prepared_before()
+            .is_some()
+    );
+    chart.set_chart_type(ChartType::VolumeFootprint);
+    for _ in 0..2 {
+        frames.run(&mut chart);
+    }
+    assert!(
+        feed.calls()
+            .iter()
+            .any(|call| matches!(call, Call::Trades(_)))
+    );
+}
+
+#[test]
+fn prepared_first_live_instant_needs_trade_history_even_on_a_bar_open() {
+    let start = bars(1)[0].time;
+    for page_first in [false, true] {
+        let (feed, mut chart, mut frames) = prepared_chart();
+        let cutoff = start + TimeDelta::minutes(1);
+        let first = Tick::new(cutoff, 100.0, 7.0, None).with_id(7);
+        let reply = feed.footprints.lock().unwrap().remove(0);
+        if !page_first {
+            feed.sink().push_tick(first.clone());
+            frames.run(&mut chart);
+        }
+        reply.send(Ok(prepared_page(
+            &[Tick::new(start, 100.0, 5.0, None)],
+            cutoff,
+            true,
+        )));
+        frames.run(&mut chart);
+        if page_first {
+            feed.sink().push_tick(first.clone());
+            frames.run(&mut chart);
+        }
+        let flow = chart
+            .feed_link
+            .as_ref()
+            .unwrap()
+            .footprint
+            .as_ref()
+            .unwrap();
+        assert!(flow.complete_bar_at(start).is_some());
+        assert!(
+            flow.complete_bar_at(cutoff).is_none(),
+            "page first {page_first}"
+        );
+        feed.trades
+            .lock()
+            .unwrap()
+            .remove(0)
+            .send(Ok(TradePage::new(vec![first], false)));
+        frames.run(&mut chart);
+        let flow = chart
+            .feed_link
+            .as_ref()
+            .unwrap()
+            .footprint
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            flow.complete_bar_at(cutoff).map(|bar| bar.unknown),
+            Some(7.0)
+        );
+    }
 }
 
 #[test]
@@ -1084,6 +1402,12 @@ fn prepared_resume_retains_known_rows_before_the_new_subscription_gap() {
     for second in [60, 120, 180] {
         feed.sink().push_tick(tick(second));
     }
+    frames.run(&mut chart);
+    feed.trades
+        .lock()
+        .unwrap()
+        .remove(0)
+        .send(Ok(TradePage::new(vec![tick(60)], false)));
     frames.run(&mut chart);
     for (seconds, expected) in [
         (vec![310, 360, 420, 480], vec![0, 1, 2, 6, 7, 8]),
@@ -4287,6 +4611,24 @@ fn feed_lifecycle() {
     }
     log::set_logger(&Warnings).unwrap();
     log::set_max_level(log::LevelFilter::Warn);
+    {
+        let feed = Arc::new(Script::default());
+        let mut chart = fed(&feed, Some("A"));
+        chart.set_chart_type(ChartType::VolumeFootprint);
+        let mut frames = Frames::new();
+        WARNINGS.set(Some(Vec::new()));
+        frames.run(&mut chart);
+        feed.resolve()
+            .send(Ok(Instrument::new("A").with_tick_size(1.0)));
+        feed.page().send(page(bars(5), true));
+        for _ in 0..3 {
+            frames.run(&mut chart);
+        }
+        assert!(
+            WARNINGS.take().unwrap().is_empty(),
+            "unsupported footprint history is normal"
+        );
+    }
     WARNINGS.set(Some(Vec::new()));
     chart.set_start_idx(0);
     for _ in 0..5 {

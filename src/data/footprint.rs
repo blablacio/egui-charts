@@ -548,10 +548,9 @@ impl Footprint {
         self.enforce_budget();
     }
 
-    /// Open of the oldest bar whose executions are all held: earlier bars were cut by the
-    /// budget or by trades dropped from the host's store, or may lack trades that never
-    /// arrived, and must not be shown as complete. With paged history this is the complete
-    /// suffix after any missing join; complete prepared bars may also precede that join.
+    /// Open of the first bar in the complete suffix after any loss or missing join.
+    /// Earlier bars may lack executions or have been evicted. Complete prepared bars can
+    /// also precede a missing join; readers such as [`profile`](Self::profile) include them.
     pub fn complete_from(&self) -> Option<DateTime<Utc>> {
         let start = match (self.incomplete_through, self.missing.last().copied()) {
             (Some(cut), Some((_, end))) if cut < end => Bound::Included(end),
@@ -592,8 +591,22 @@ impl Footprint {
         self.bars.get(&open).filter(|_| self.complete_at(open))
     }
 
+    /// A span of whole bars must start inside held coverage and contain no incomplete bar.
+    #[cfg(any(feature = "drawings", feature = "studies"))]
+    pub(crate) fn span_is_complete(&self, first: DateTime<Utc>, last: DateTime<Utc>) -> bool {
+        let (first, last) = (self.clock.bar_open(first), self.clock.bar_open(last));
+        first <= last
+            && self
+                .bars
+                .first_key_value()
+                .is_some_and(|(held, _)| *held <= first)
+            && self.complete_at(first)
+            && self.complete_at(last)
+            && !self.span_has_gap(first, Some(last))
+    }
+
     /// Whether missing executions could change a result spanning these times.
-    #[cfg(any(feature = "widget", feature = "studies", test))]
+    #[cfg(any(feature = "widget", feature = "studies"))]
     pub(crate) fn span_has_gap(&self, from: DateTime<Utc>, through: Option<DateTime<Utc>>) -> bool {
         self.missing
             .get(self.missing.partition_point(|(_, end)| *end <= from))
@@ -601,7 +614,7 @@ impl Footprint {
     }
 
     /// Keeps disjoint reconnect gaps separate so complete bars between them remain usable.
-    #[cfg(any(feature = "widget", test))]
+    #[cfg(feature = "widget")]
     pub(crate) fn add_missing(&mut self, mut from: DateTime<Utc>, mut end: DateTime<Utc>) {
         if from >= end {
             return;
@@ -624,7 +637,7 @@ impl Footprint {
     }
 
     /// Removes only execution coverage actually supplied by a trade page.
-    #[cfg(any(feature = "widget", test))]
+    #[cfg(feature = "widget")]
     pub(crate) fn cover_missing(&mut self, from: DateTime<Utc>, end: DateTime<Utc>) {
         if from >= end {
             return;
@@ -667,12 +680,25 @@ impl Footprint {
         let boundary = self.bars.get(&self.clock.bar_open(before)).cloned();
         self.prepared = Some((before, boundary));
         if !from_start {
+            let first = trades.iter().next();
+            let unconfirmed = first.is_some_and(|first| {
+                trades
+                    .live()
+                    .next()
+                    .is_some_and(|live| std::ptr::eq(first, live))
+            });
             self.add_missing(
                 before,
-                trades
-                    .iter()
-                    .next()
-                    .map_or(DateTime::<Utc>::MAX_UTC, |trade| trade.ts),
+                first.map_or(DateTime::<Utc>::MAX_UTC, |trade| {
+                    if unconfirmed {
+                        trade
+                            .ts
+                            .checked_add_signed(chrono::TimeDelta::nanoseconds(1))
+                            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+                    } else {
+                        trade.ts
+                    }
+                }),
             );
         }
     }
@@ -733,20 +759,23 @@ impl Footprint {
         if let Some(left) = trades.left_out_at().filter(|left| *left >= before) {
             self.add_missing(left, after(left));
         }
-        if let Some(retained) = trades.retained_until() {
-            let from = retained.max(before);
-            let end = trades
-                .live()
-                .find(|trade| trade.ts >= from)
-                .map_or(DateTime::<Utc>::MAX_UTC, |trade| trade.ts);
-            self.add_missing(from, end);
+        let tape = trades.retained_until();
+        let stream = trades
+            .live()
+            .find(|trade| tape.is_none_or(|until| trade.ts >= until))
+            .map(|trade| after(trade.ts));
+        if let Some(retained) = tape {
+            self.add_missing(
+                retained.max(before),
+                stream.unwrap_or(DateTime::<Utc>::MAX_UTC),
+            );
         }
         // Once a stream begins, only the open-ended join gains a known upper boundary.
         if let Some(&(from, end)) = self.missing.last()
             && end == DateTime::<Utc>::MAX_UTC
-            && let Some(first) = trades.live().find(|trade| trade.ts >= from)
+            && let Some(first) = stream
         {
-            self.cover_missing(first.ts, end);
+            self.cover_missing(first.max(from), end);
         }
     }
 
@@ -935,7 +964,7 @@ impl Footprint {
     }
 
     /// The calendar the bars open by.
-    #[cfg(feature = "studies")]
+    #[cfg(any(feature = "widget", feature = "studies"))]
     pub(crate) fn clock(&self) -> &BarClock {
         &self.clock
     }
@@ -1382,6 +1411,7 @@ mod tests {
         Footprint::from_bars(BarClock::new(Timeframe::Min1), 0.25, 2, bars)
     }
 
+    #[cfg(feature = "widget")]
     #[test]
     fn disjoint_gaps_keep_known_bars_and_only_shrink_with_proven_coverage() {
         let start: DateTime<Utc> = "2026-01-05T10:00:00Z".parse().unwrap();
@@ -1400,10 +1430,16 @@ mod tests {
         assert!(!flow.span_has_gap(at(7), Some(at(7))));
         assert!(flow.span_has_gap(at(4), Some(at(8))));
         flow.cover_missing(at(1), at(7));
-        assert_eq!(flow.missing, vec![(at(8), at(9))]);
+        assert_eq!(
+            flow.complete_bars(..).map(|b| b.time).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 9].map(at)
+        );
         flow.add_missing(at(7), at(8));
         flow.add_missing(at(6), at(10));
-        assert_eq!(flow.missing, vec![(at(6), at(10))]);
+        assert_eq!(
+            flow.complete_bars(..).map(|b| b.time).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5].map(at)
+        );
         flow.cover_missing(at(0), at(10));
         assert_eq!(flow.complete_from(), Some(start));
         assert!(!flow.span_has_gap(start, None));
